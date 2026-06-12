@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    return NextResponse.json({ scenarios: listScenarios() });
+    return NextResponse.json({ scenarios: await listScenarios() });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
     const name: string = body.name || "Untitled Fund";
     const description: string = body.description || "";
     const model = body.model || buildDefaultModel();
-    const rec = createScenario(name, description, model);
+    const rec = await createScenario(name, description, model);
     return NextResponse.json({ scenario: rec }, { status: 201 });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });

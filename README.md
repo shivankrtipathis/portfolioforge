@@ -22,7 +22,33 @@ For a production build:
 npm run build && npm start
 ```
 
-> Requires **Node 22+** (the database uses Node's built-in `node:sqlite`).
+Locally, with no environment variables set, data is stored in a local libSQL
+file at `data/portfolio.db` — nothing to configure.
+
+## Deploy to Vercel
+
+The app deploys to Vercel as a standard Next.js project, but Vercel's serverless
+filesystem is **read-only**, so the local SQLite file can't be used in
+production. Point it at a **Turso** database (serverless, SQLite-compatible)
+instead — the code auto-switches to Turso when the env vars below are present.
+
+1. **Create a Turso database** (free): install the CLI and run
+   ```bash
+   turso db create portfolioforge
+   turso db show portfolioforge --url        # -> TURSO_DATABASE_URL
+   turso db tokens create portfolioforge     # -> TURSO_AUTH_TOKEN
+   ```
+   (or create one in the Turso web dashboard).
+2. **Import the repo** at [vercel.com/new](https://vercel.com/new) — Vercel
+   auto-detects Next.js.
+3. In the Vercel project → **Settings → Environment Variables**, add:
+   - `TURSO_DATABASE_URL` — e.g. `libsql://portfolioforge-<org>.turso.io`
+   - `TURSO_AUTH_TOKEN` — the token from step 1
+4. **Deploy** (or redeploy). On first load the app seeds the default scenario
+   into Turso, and saving/loading works.
+
+The same env vars work locally too (drop them in `.env.local`) if you want local
+dev to share the Turso database instead of the local file.
 
 ## What it does
 
@@ -61,19 +87,20 @@ the database.
 | Charts | Recharts |
 | Calculation engine | Pure TypeScript (`src/lib/engine.ts`) — runs client-side for instant reactivity |
 | API | Next.js route handlers (`src/app/api/scenarios/...`) |
-| Database | **SQLite** via Node's built-in `node:sqlite` — file at `data/portfolio.db` |
+| Database | **libSQL** (`@libsql/client`) — local file `data/portfolio.db` in dev, **Turso** in production |
 
 ### Key files
 - `src/lib/types.ts` — the domain model (fund settings, fees, waterfall, strategy, companies).
 - `src/lib/engine.ts` — ownership/dilution progression, exit proceeds, cash-flow schedule,
   the carry waterfall, XIRR, and all aggregate metrics.
 - `src/lib/defaults.ts` — the seeded **3iP Fund II** base-case model.
-- `src/lib/db.ts` — SQLite persistence (scenarios stored as model JSON + denormalized headline columns).
+- `src/lib/db.ts` — libSQL/Turso persistence (scenarios stored as model JSON + denormalized headline columns).
 - `src/components/sections/*` — the six UI sections.
 
 ### Data & persistence
-All scenarios live in `data/portfolio.db` (a single SQLite file). On first run the app
-seeds a **"3iP Fund II — Base Case"** scenario. Your edits auto-save; delete the file to reset.
+Scenarios are stored in a libSQL database — a local `data/portfolio.db` file in dev,
+or a hosted **Turso** database in production (see *Deploy to Vercel*). On first run the
+app seeds a **"3iP Fund II — Base Case"** scenario. Your edits auto-save.
 
 ## Modeling notes
 - **Ownership** at each round updates as `own × (1 − roundSize/postMoney) + investThisRound/postMoney`,

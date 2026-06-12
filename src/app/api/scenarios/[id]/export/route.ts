@@ -21,7 +21,7 @@ function workbookResponse(name: string, model: FundModel) {
 
 export async function GET(_req: NextRequest, { params }: { params: { id: string } }) {
   const id = Number(params.id);
-  const rec = getScenario(id);
+  const rec = await getScenario(id);
   if (!rec) return NextResponse.json({ error: "Not found" }, { status: 404 });
   return workbookResponse(rec.name, rec.model);
 }

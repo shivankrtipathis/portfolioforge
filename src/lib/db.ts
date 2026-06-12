@@ -1,42 +1,74 @@
-// Database layer — persistence via Node's built-in SQLite (node:sqlite).
-// Zero native dependencies. Scenarios store the full FundModel as JSON; the
-// table also keeps denormalized headline columns (fund size, MOIC) so the
-// scenario list can be queried/sorted without parsing every blob.
+// Database layer — persistence via libSQL / Turso.
+//
+// Works in two modes from the same code:
+//   • Production (Vercel): set TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) and it
+//     talks to a remote Turso database over HTTP using the pure-JS web client
+//     (no native deps, safe on serverless / read-only filesystems).
+//   • Local dev: with no env vars it falls back to a local libSQL file at
+//     ./data/portfolio.db (SQLite-compatible, so existing local data is kept).
+//
+// Scenarios store the full FundModel as JSON plus denormalized headline columns
+// (fund size, gross MOIC, net IRR) so the list can be queried without parsing
+// every blob.
 
-import { DatabaseSync } from "node:sqlite";
+import type { Client, Row } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
 import { FundModel, ScenarioRecord } from "./types";
 import { buildDefaultModel } from "./defaults";
 import { computeModel } from "./engine";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DB_PATH = path.join(DATA_DIR, "portfolio.db");
+// Reuse the connection + init across hot reloads / warm serverless invocations.
+const g = globalThis as unknown as {
+  __pcClient?: Promise<Client>;
+  __pcReady?: Promise<void>;
+};
 
-// Reuse the connection across Next.js hot reloads in dev.
-const g = globalThis as unknown as { __pcDb?: DatabaseSync };
+function getClient(): Promise<Client> {
+  if (g.__pcClient) return g.__pcClient;
+  g.__pcClient = (async () => {
+    const url = process.env.TURSO_DATABASE_URL;
+    if (url) {
+      // Remote Turso — fetch-based web client, no native bindings.
+      const { createClient } = await import("@libsql/client/web");
+      return createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
+    }
+    // Local dev fallback: a libSQL file on disk.
+    const { createClient } = await import("@libsql/client");
+    const dir = path.join(process.cwd(), "data");
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return createClient({ url: `file:${path.join(dir, "portfolio.db")}` });
+  })();
+  return g.__pcClient;
+}
 
-function getDb(): DatabaseSync {
-  if (g.__pcDb) return g.__pcDb;
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS scenarios (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      model_json TEXT NOT NULL,
-      fund_size REAL NOT NULL DEFAULT 0,
-      gross_moic REAL NOT NULL DEFAULT 0,
-      net_irr REAL NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
-  g.__pcDb = db;
-  ensureSeed(db);
-  return db;
+async function ready(): Promise<void> {
+  if (g.__pcReady) return g.__pcReady;
+  const p = (async () => {
+    const db = await getClient();
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS scenarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        model_json TEXT NOT NULL,
+        fund_size REAL NOT NULL DEFAULT 0,
+        gross_moic REAL NOT NULL DEFAULT 0,
+        net_irr REAL NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    await ensureSeed(db);
+  })();
+  g.__pcReady = p;
+  try {
+    await p;
+  } catch (e) {
+    // Don't cache a failed init — allow the next request to retry.
+    g.__pcReady = undefined;
+    throw e;
+  }
 }
 
 function headline(model: FundModel): { fundSize: number; grossMOIC: number; netIRR: number } {
@@ -48,29 +80,31 @@ function headline(model: FundModel): { fundSize: number; grossMOIC: number; netI
   }
 }
 
-function ensureSeed(db: DatabaseSync) {
-  const row = db.prepare("SELECT COUNT(*) AS n FROM scenarios").get() as { n: number };
-  if (row.n > 0) return;
+async function ensureSeed(db: Client) {
+  const res = await db.execute("SELECT COUNT(*) AS n FROM scenarios");
+  const n = Number((res.rows[0] as Row & { n: number }).n);
+  if (n > 0) return;
   const model = buildDefaultModel();
   const h = headline(model);
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO scenarios (name, description, model_json, fund_size, gross_moic, net_irr, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    "3iP Fund II — Base Case",
-    "50-company pre-seed/seed fund. Seeded from the 3iP Fund II construction model.",
-    JSON.stringify(model),
-    h.fundSize,
-    h.grossMOIC,
-    isFinite(h.netIRR) ? h.netIRR : 0,
-    now,
-    now
-  );
+  await db.execute({
+    sql: `INSERT INTO scenarios (name, description, model_json, fund_size, gross_moic, net_irr, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      "3iP Fund II — Base Case",
+      "50-company pre-seed/seed fund. Seeded from the 3iP Fund II construction model.",
+      JSON.stringify(model),
+      h.fundSize,
+      h.grossMOIC,
+      isFinite(h.netIRR) ? h.netIRR : 0,
+      now,
+      now,
+    ],
+  });
 }
 
-interface Row {
-  id: number;
+interface DbRow {
+  id: number | bigint;
   name: string;
   description: string;
   model_json: string;
@@ -81,9 +115,9 @@ interface Row {
   updated_at: string;
 }
 
-function toRecord(r: Row): ScenarioRecord {
+function toRecord(r: DbRow): ScenarioRecord {
   return {
-    id: r.id,
+    id: Number(r.id),
     name: r.name,
     description: r.description,
     model: JSON.parse(r.model_json) as FundModel,
@@ -103,13 +137,14 @@ export interface ScenarioSummary {
   updatedAt: string;
 }
 
-export function listScenarios(): ScenarioSummary[] {
-  const db = getDb();
-  const rows = db
-    .prepare("SELECT id, name, description, fund_size, gross_moic, net_irr, created_at, updated_at FROM scenarios ORDER BY updated_at DESC")
-    .all() as Omit<Row, "model_json">[];
-  return rows.map((r) => ({
-    id: r.id,
+export async function listScenarios(): Promise<ScenarioSummary[]> {
+  await ready();
+  const db = await getClient();
+  const res = await db.execute(
+    "SELECT id, name, description, fund_size, gross_moic, net_irr, created_at, updated_at FROM scenarios ORDER BY updated_at DESC"
+  );
+  return (res.rows as unknown as DbRow[]).map((r) => ({
+    id: Number(r.id),
     name: r.name,
     description: r.description,
     fundSize: r.fund_size,
@@ -120,51 +155,56 @@ export function listScenarios(): ScenarioSummary[] {
   }));
 }
 
-export function getScenario(id: number): ScenarioRecord | null {
-  const db = getDb();
-  const row = db.prepare("SELECT * FROM scenarios WHERE id = ?").get(id) as Row | undefined;
+export async function getScenario(id: number): Promise<ScenarioRecord | null> {
+  await ready();
+  const db = await getClient();
+  const res = await db.execute({ sql: "SELECT * FROM scenarios WHERE id = ?", args: [id] });
+  const row = res.rows[0] as unknown as DbRow | undefined;
   return row ? toRecord(row) : null;
 }
 
-export function createScenario(name: string, description: string, model: FundModel): ScenarioRecord {
-  const db = getDb();
+export async function createScenario(name: string, description: string, model: FundModel): Promise<ScenarioRecord> {
+  await ready();
+  const db = await getClient();
   const h = headline(model);
   const now = new Date().toISOString();
-  const info = db
-    .prepare(
-      `INSERT INTO scenarios (name, description, model_json, fund_size, gross_moic, net_irr, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(name, description, JSON.stringify(model), h.fundSize, h.grossMOIC, isFinite(h.netIRR) ? h.netIRR : 0, now, now);
-  return getScenario(Number(info.lastInsertRowid))!;
+  const res = await db.execute({
+    sql: `INSERT INTO scenarios (name, description, model_json, fund_size, gross_moic, net_irr, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [name, description, JSON.stringify(model), h.fundSize, h.grossMOIC, isFinite(h.netIRR) ? h.netIRR : 0, now, now],
+  });
+  const id = Number(res.lastInsertRowid);
+  return (await getScenario(id))!;
 }
 
-export function updateScenario(
+export async function updateScenario(
   id: number,
   fields: { name?: string; description?: string; model?: FundModel }
-): ScenarioRecord | null {
-  const db = getDb();
-  const existing = getScenario(id);
+): Promise<ScenarioRecord | null> {
+  const existing = await getScenario(id);
   if (!existing) return null;
+  const db = await getClient();
   const name = fields.name ?? existing.name;
   const description = fields.description ?? existing.description;
   const model = fields.model ?? existing.model;
   const h = headline(model);
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE scenarios SET name = ?, description = ?, model_json = ?, fund_size = ?, gross_moic = ?, net_irr = ?, updated_at = ? WHERE id = ?`
-  ).run(name, description, JSON.stringify(model), h.fundSize, h.grossMOIC, isFinite(h.netIRR) ? h.netIRR : 0, now, id);
+  await db.execute({
+    sql: `UPDATE scenarios SET name = ?, description = ?, model_json = ?, fund_size = ?, gross_moic = ?, net_irr = ?, updated_at = ? WHERE id = ?`,
+    args: [name, description, JSON.stringify(model), h.fundSize, h.grossMOIC, isFinite(h.netIRR) ? h.netIRR : 0, now, id],
+  });
   return getScenario(id);
 }
 
-export function deleteScenario(id: number): boolean {
-  const db = getDb();
-  const info = db.prepare("DELETE FROM scenarios WHERE id = ?").run(id);
-  return info.changes > 0;
+export async function deleteScenario(id: number): Promise<boolean> {
+  await ready();
+  const db = await getClient();
+  const res = await db.execute({ sql: "DELETE FROM scenarios WHERE id = ?", args: [id] });
+  return res.rowsAffected > 0;
 }
 
-export function duplicateScenario(id: number, newName?: string): ScenarioRecord | null {
-  const existing = getScenario(id);
+export async function duplicateScenario(id: number, newName?: string): Promise<ScenarioRecord | null> {
+  const existing = await getScenario(id);
   if (!existing) return null;
   return createScenario(newName ?? `${existing.name} (copy)`, existing.description, existing.model);
 }
